@@ -1,11 +1,11 @@
+import logging
 import os
+
 import numpy as np
 import pandas as pd
-import multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor
-from itertools import repeat
-from cafaeval.parser import obo_parser, gt_parser, pred_parser
-import logging
+from scipy import sparse
+
+from cafaeval.parser import gt_parser, obo_parser, pred_parser
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
@@ -28,95 +28,84 @@ def compute_s(ru, mi):
 
 
 def compute_confusion_matrix(tau_arr, g, pred, n_gt, ic_arr=None):
-    """
-    Perform the evaluation at the matrix level for all tau thresholds
-    The calculation is
-    """
-    # n, tp, fp, fn, pr, rc (fp = misinformation, fn = remaining uncertainty)
     metrics = np.zeros((len(tau_arr), 6), dtype="float")
 
+    g_csr = sparse.csr_matrix(g)
+    pred_csr = sparse.csr_matrix(pred)
+
+    if ic_arr is not None:
+        ic_diag = sparse.diags(ic_arr)
+
     for i, tau in enumerate(tau_arr):
-        # Filter predictions based on tau threshold
-        p = solidify_prediction(pred, tau)
+        p = pred_csr >= tau
 
-        # Terms subsets
-        intersection = np.logical_and(p, g)  # TP
-        mis = np.logical_and(
-            p, np.logical_not(g)
-        )  # FP, predicted but not in the ground truth
-        remaining = np.logical_and(
-            np.logical_not(p), g
-        )  # FN, not predicted but in the ground truth
+        intersection = p.multiply(g_csr).astype(bool)
+        mis = p > g_csr
+        remaining = g_csr > p
 
-        # Weighted evaluation
         if ic_arr is not None:
-            p = p * ic_arr
-            intersection = intersection * ic_arr  # TP
-            mis = mis * ic_arr  # FP, predicted but not in the ground truth
-            remaining = remaining * ic_arr  # FN, not predicted but in the ground truth
+            p_w = p @ ic_diag
+            intersection_w = intersection @ ic_diag
+            mis_w = mis @ ic_diag
+            remaining_w = remaining @ ic_diag
 
-        n_pred = p.sum(axis=1)  # TP + FP
-        n_intersection = intersection.sum(axis=1)  # TP
+            n_pred = np.asarray(p_w.sum(axis=1)).ravel()
+            n_intersection = np.asarray(intersection_w.sum(axis=1)).ravel()
 
-        # Number of proteins with at least one term predicted with score >= tau
-        metrics[i, 0] = (p.sum(axis=1) > 0).sum()
+            metrics[i, 0] = (np.asarray(p_w.sum(axis=1)).ravel() > 0).sum()
+            metrics[i, 1] = n_intersection.sum()
+            metrics[i, 2] = mis_w.sum()
+            metrics[i, 3] = remaining_w.sum()
+        else:
+            n_pred = np.asarray(p.sum(axis=1)).ravel()
+            n_intersection = np.asarray(intersection.sum(axis=1)).ravel()
 
-        # Sum of confusion matrices
-        metrics[i, 1] = n_intersection.sum()  # TP
-        metrics[i, 2] = mis.sum(axis=1).sum()  # FP
-        metrics[i, 3] = remaining.sum(axis=1).sum()  # FN
+            metrics[i, 0] = (n_pred > 0).sum()
+            metrics[i, 1] = n_intersection.sum()
+            metrics[i, 2] = mis.sum()
+            metrics[i, 3] = remaining.sum()
 
-        # Macro-averaging
         metrics[i, 4] = np.divide(
             n_intersection,
             n_pred,
             out=np.zeros_like(n_intersection, dtype="float"),
             where=n_pred > 0,
-        ).sum()  # Precision
+        ).sum()
+
         metrics[i, 5] = np.divide(
-            n_intersection, n_gt, out=np.zeros_like(n_gt, dtype="float"), where=n_gt > 0
-        ).sum()  # Recall
+            n_intersection,
+            n_gt,
+            out=np.zeros_like(n_gt, dtype="float"),
+            where=n_gt > 0,
+        ).sum()
 
     return metrics
 
 
 def compute_metrics(pred, gt, tau_arr, toi, ic_arr=None, n_cpu=0):
-    """
-    Takes the prediction and the ground truth and for each threshold in tau_arr
-    calculates the confusion matrix and returns the coverage,
-    precision, recall, remaining uncertainty and misinformation.
-    Toi is the list of terms (indexes) to be considered
-    """
-    if n_cpu == 0:
-        n_cpu = mp.cpu_count()
-
     columns = ["n", "tp", "fp", "fn", "pr", "rc"]
 
-    # Slice once and reuse (shared by all threads)
-    g = gt.matrix[:, toi]
-    pred_sub = pred.matrix[:, toi]
+    if len(toi) == gt.matrix.shape[1]:
+        g = gt.matrix
+        pred_sub = pred.matrix
+    else:
+        g = gt.matrix[:, toi]
+        pred_sub = pred.matrix[:, toi]
+
     w = None if ic_arr is None else ic_arr[toi]
 
-    # Precompute n_gt once
-    n_gt = g.sum(axis=1) if w is None else (g * w).sum(axis=1)
-
-    # Don’t start more workers than chunks
-    n_workers = min(n_cpu, len(tau_arr))
-    tau_chunks = np.array_split(tau_arr, n_workers)
-
-    with ThreadPoolExecutor(max_workers=n_workers) as ex:
-        parts = list(
-            ex.map(
-                compute_confusion_matrix,
-                tau_chunks,
-                repeat(g),
-                repeat(pred_sub),
-                repeat(n_gt),
-                repeat(w),
-            )
+    if w is None:
+        n_gt = (
+            np.asarray(g.sum(axis=1)).ravel() if sparse.issparse(g) else g.sum(axis=1)
         )
+    else:
+        if sparse.issparse(g):
+            n_gt = np.asarray((g @ sparse.diags(w)).sum(axis=1)).ravel()
+        else:
+            n_gt = (g * w).sum(axis=1)
 
-    metrics = np.concatenate(parts, axis=0)
+    metrics = compute_confusion_matrix(tau_arr, g, pred_sub, n_gt, w)
+
     return pd.DataFrame(metrics, columns=columns)
 
 

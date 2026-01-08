@@ -12,7 +12,7 @@ config = {
     "prop": "max",
     "max_terms": None,
     "th_step": 0.01,
-    "n_cpu": 1,
+    "n_cpu": 12,
 }
 
 
