@@ -24,6 +24,7 @@ dependencies = [
     'pandas',
     'matplotlib',
     'numpy',
+    'scipy'
 ]
 
 [project.urls]

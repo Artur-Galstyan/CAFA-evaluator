@@ -1,6 +1,8 @@
 import numpy as np
-import copy
+from scipy import sparse
+from tqdm import tqdm
 import logging
+
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 
@@ -11,8 +13,8 @@ class Graph:
     DAG(i,j) == 1 means that the go term i is_a (or is part_of) j
     Parents that are in a different namespace are discarded
     """
-    def __init__(self, namespace, terms_dict, ia_dict=None, orphans=False):
 
+    def __init__(self, namespace, terms_dict, ia_dict=None, orphans=False):
         """
         terms_dict = {term: {name: , namespace: , def: , alt_id: , rel:}}
         """
@@ -29,47 +31,68 @@ class Graph:
 
         rel_list = []
         for self.idxs, (term_id, term) in enumerate(terms_dict.items()):
-            rel_list.extend([[term_id, rel, term['namespace']] for rel in term['rel']])
-            self.terms_list.append({'id': term_id, 'name': term['name'], 'namespace': namespace, 'def': term['def'],
-                                 'adj': set(), 'children': set()})
-            self.terms_dict[term_id] = {'index': self.idxs, 'name': term['name'], 'namespace': namespace, 'def': term['def']}
-            for a_id in term['alt_id']:
+            rel_list.extend([[term_id, rel, term["namespace"]] for rel in term["rel"]])
+            self.terms_list.append(
+                {
+                    "id": term_id,
+                    "name": term["name"],
+                    "namespace": namespace,
+                    "def": term["def"],
+                    "adj": set(),
+                    "children": set(),
+                }
+            )
+            self.terms_dict[term_id] = {
+                "index": self.idxs,
+                "name": term["name"],
+                "namespace": namespace,
+                "def": term["def"],
+            }
+            for a_id in term["alt_id"]:
                 self.terms_dict_alt.setdefault(a_id, set()).add(term_id)
 
         self.idxs += 1
 
-        self.dag = np.zeros((self.idxs, self.idxs), dtype='bool')
+        self.dag = np.zeros((self.idxs, self.idxs), dtype="bool")
 
         # id1 term (row, axis 0), id2 parent (column, axis 1)
         for id1, id2, ns in rel_list:
             if self.terms_dict.get(id2):
-                i = self.terms_dict[id1]['index']
-                j = self.terms_dict[id2]['index']
+                i = self.terms_dict[id1]["index"]
+                j = self.terms_dict[id2]["index"]
                 self.dag[i, j] = 1
-                self.terms_list[i]['adj'].add(j)
-                self.terms_list[j]['children'].add(i)
+                self.terms_list[i]["adj"].add(j)
+                self.terms_list[j]["children"].add(i)
                 logging.debug("i,j {},{} {},{}".format(i, j, id1, id2))
             else:
-                logging.debug('Skipping branch to external namespace: {}'.format(id2))
+                logging.debug("Skipping branch to external namespace: {}".format(id2))
         logging.debug("dag {}".format(self.dag))
         # Topological sorting
         self.top_sort()
         logging.debug("order sorted {}".format(self.order))
 
         if orphans:
-            self.toi = np.arange(self.dag.shape[0])  # All terms, also those without parents
+            self.toi = np.arange(
+                self.dag.shape[0]
+            )  # All terms, also those without parents
         else:
-            self.toi = np.nonzero(self.dag.sum(axis=1) > 0)[0]  # Only terms with parents
+            self.toi = np.nonzero(self.dag.sum(axis=1) > 0)[
+                0
+            ]  # Only terms with parents
         logging.debug("toi {}".format(self.toi))
 
         if ia_dict is not None:
             self.set_ia(ia_dict)
 
-        logging.info("Ontology: {}, total {}, roots {}, leaves {}, alternative_ids {}".format(self.namespace,
-                                                                len(np.where(self.dag.sum(axis=1) != 0)[0]),
-                                                                len(np.where(self.dag.sum(axis=1) == 0)[0]),
-                                                                len(np.where(self.dag.sum(axis=0) == 0)[0]),
-                                                                len(self.terms_dict_alt)))
+        logging.info(
+            "Ontology: {}, total {}, roots {}, leaves {}, alternative_ids {}".format(
+                self.namespace,
+                len(np.where(self.dag.sum(axis=1) != 0)[0]),
+                len(np.where(self.dag.sum(axis=1) == 0)[0]),
+                len(np.where(self.dag.sum(axis=0) == 0)[0]),
+                len(self.terms_dict_alt),
+            )
+        )
 
         return
 
@@ -98,7 +121,7 @@ class Graph:
             idx = queue.pop(0)
             indexes.append(idx)
             in_degree[idx] -= 1
-            l = self.terms_list[idx]['adj']
+            l = self.terms_list[idx]["adj"]
             if len(l) > 0:
                 for j in l:
                     in_degree[j] -= 1
@@ -113,12 +136,12 @@ class Graph:
             raise Exception("The sparse matrix doesn't represent an acyclic graph")
 
     def set_ia(self, ia_dict):
-        self.ia = np.zeros(self.idxs, dtype='float')
+        self.ia = np.zeros(self.idxs, dtype="float")
         for term_id in self.terms_dict:
             if ia_dict.get(term_id):
-                self.ia[self.terms_dict[term_id]['index']] = ia_dict.get(term_id)
+                self.ia[self.terms_dict[term_id]["index"]] = ia_dict.get(term_id)
             else:
-                logging.debug('Missing IA for term: {}'.format(term_id))
+                logging.debug("Missing IA for term: {}".format(term_id))
         # Convert inf to zero
         np.nan_to_num(self.ia, copy=False, nan=0, posinf=0, neginf=0)
         self.toi_ia = np.nonzero(self.ia > 0)[0]
@@ -128,13 +151,19 @@ class Prediction:
     """
     The score matrix contains the scores given by the predictor for every node of the ontology
     """
+
     def __init__(self, ids, matrix, namespace=None):
         self.ids = ids
         self.matrix = matrix  # scores
         self.namespace = namespace
 
     def __str__(self):
-        return "\n".join(["{}\t{}\t{}".format(index, self.matrix[index], self.namespace) for index, _id in enumerate(self.ids)])
+        return "\n".join(
+            [
+                "{}\t{}\t{}".format(index, self.matrix[index], self.namespace)
+                for index, _id in enumerate(self.ids)
+            ]
+        )
 
 
 class GroundTruth:
@@ -144,36 +173,54 @@ class GroundTruth:
         self.namespace = namespace
 
 
-def propagate(matrix, ont, order, mode='max'):
-    """
-    Update inplace the score matrix (proteins x terms) up to the root taking the max between children and parents
-    """
+def propagate(matrix, ont, order, mode="max"):
     if matrix.shape[0] == 0:
         raise Exception("Empty matrix")
+    sums = np.sum(matrix, axis=0)[order]
 
-    deepest = np.where(np.sum(matrix[:, order], axis=0) > 0)[0][0]
-    if deepest.size == 0:
+    deepest = np.argmax(sums > 0)
+    if sums[deepest] == 0:
         raise Exception("The matrix is empty")
+    order_ = order[deepest:]
 
-    # Remove leaves
-    order_ = np.delete(order, [range(0, deepest)])
+    matrix_csc = sparse.csc_matrix(matrix)
+    col_to_rows = {}
+    for c in range(matrix.shape[1]):
+        start_ptr = matrix_csc.indptr[c]
+        end_ptr = matrix_csc.indptr[c + 1]
+        col_to_rows[c] = set(matrix_csc.indices[start_ptr:end_ptr].tolist())
 
-    for i in order_:
-        # Get direct children
-        children = np.where(ont.dag[:, i] != 0)[0]
-        if children.size > 0:
-            # Add current terms to children
-            cols = np.concatenate((children, [i]))
-            if mode == 'max':
-                matrix[:, i] = matrix[:, cols].max(axis=1)
-            elif mode == 'fill':
-                # Select only rows where the current term is 0
-                rows = np.where(matrix[:, i] == 0)[0]
-                if rows.size:
-                    idx = np.ix_(rows, cols)
-                    matrix[rows, i] = matrix[idx].max(axis=1)
+    for i in tqdm(order_, desc="propagate"):
+        children_set = ont.terms_list[i]["children"]
+        if not children_set:
+            continue
+
+        active_rows = set()
+        for c in children_set:
+            active_rows.update(col_to_rows[c])
+
+        if not active_rows:
+            continue
+
+        active_rows = np.array(sorted(active_rows), dtype=np.intp)
+        children = np.fromiter(children_set, dtype=np.intp, count=len(children_set))
+
+        if mode == "max":
+            children_max = matrix[np.ix_(active_rows, children)].max(axis=1)
+            old_vals = matrix[active_rows, i]
+            new_vals = np.maximum(old_vals, children_max)
+            matrix[active_rows, i] = new_vals
+
+            newly_nonzero = active_rows[(old_vals == 0) & (new_vals > 0)]
+            col_to_rows[i].update(newly_nonzero.tolist())
+
+        elif mode == "fill":
+            zero_mask = matrix[active_rows, i] == 0
+            rows_to_fill = active_rows[zero_mask]
+            if rows_to_fill.size > 0:
+                fill_vals = matrix[np.ix_(rows_to_fill, children)].max(axis=1)
+                matrix[rows_to_fill, i] = fill_vals
+                newly_nonzero = rows_to_fill[fill_vals > 0]
+                col_to_rows[i].update(newly_nonzero.tolist())
+
     return
-
-
-
-

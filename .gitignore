@@ -8,4 +8,8 @@ harmonic_mean.ipynb
 /.venv/
 /dist/
 src/.ipynb_checkpoints
-
+.DS_Store
+preds/
+*.tsv
+IA.tsv
+__pycache__
