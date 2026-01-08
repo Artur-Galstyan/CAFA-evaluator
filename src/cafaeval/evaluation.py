@@ -1,5 +1,4 @@
 import os
-from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import multiprocessing as mp
@@ -243,7 +242,7 @@ def cafa_eval(
 
     # Parse prediction files and perform evaluation
     dfs = []
-    for file_name in tqdm(pred_files, "Iterating over pred_files"):
+    for file_name in pred_files:
         prediction = pred_parser(file_name, ontologies, gt, prop, max_terms)
         if not prediction:
             logging.warning("Prediction: {}, not evaluated".format(file_name))

@@ -1,6 +1,5 @@
 import numpy as np
 from scipy import sparse
-from tqdm import tqdm
 import logging
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
@@ -190,7 +189,7 @@ def propagate(matrix, ont, order, mode="max"):
         end_ptr = matrix_csc.indptr[c + 1]
         col_to_rows[c] = set(matrix_csc.indices[start_ptr:end_ptr].tolist())
 
-    for i in tqdm(order_, desc="propagate"):
+    for i in order_:
         children_set = ont.terms_list[i]["children"]
         if not children_set:
             continue

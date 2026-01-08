@@ -1,6 +1,5 @@
 from cafaeval.graph import Graph, Prediction, GroundTruth, propagate
 import numpy as np
-from tqdm import tqdm
 import logging
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
@@ -117,7 +116,7 @@ def gt_parser(gt_file, ontologies):
                         break
 
     gts = {}
-    for ns in tqdm(ontologies, desc="gt_parser"):
+    for ns in ontologies:
         if gt_dict.get(ns):
             matrix = np.zeros((len(gt_dict[ns]), ontologies[ns].idxs), dtype="bool")
             ids = {}
@@ -180,7 +179,7 @@ def pred_parser(pred_file, ontologies, gts, prop_mode, max_terms=None):
                             matrix[ns][i, j] = max(matrix[ns][i, j], float(prob))
 
     predictions = {}
-    for ns in tqdm(ids, desc="pred_parser"):
+    for ns in ids:
         if ids[ns]:
             logging.info("pred matrix {} {} ".format(ns, matrix))
             propagate(
