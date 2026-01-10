@@ -5,6 +5,7 @@ import numpy as np
 import polars as pl
 from scipy import sparse
 
+from cafaeval.graph import Prediction, propagate
 from cafaeval.parser import gt_parser, obo_parser, pred_parser
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
@@ -318,6 +319,247 @@ def cafa_eval(
         logging.info("No predictions evaluated")
 
     return df, dfs_best
+
+
+def pred_df_parser(pred_df, ontologies, gts, prop_mode, max_terms=None):
+    """
+    Parse a prediction polars DataFrame and returns a dict of Prediction objects, one for each namespace.
+
+    Args:
+        pred_df: polars DataFrame with columns 'protein_id', 'term_id', 'score'
+        ontologies: dict of ontology Graph objects
+        gts: dict of GroundTruth objects
+        prop_mode: propagation mode ('max', 'fill', etc.)
+        max_terms: optional max number of terms per protein
+
+    Returns:
+        dict of Prediction objects keyed by namespace
+    """
+    ids = {}
+    matrix = {}
+    ns_dict = {}
+    replaced = {}
+
+    for ns in gts:
+        matrix[ns] = np.zeros(gts[ns].matrix.shape, dtype="float")
+        ids[ns] = {}
+        for term in ontologies[ns].terms_dict:
+            ns_dict[term] = ns
+        for term in ontologies[ns].terms_dict_alt:
+            ns_dict[term] = ns
+
+    # Iterate over the DataFrame rows
+    for row in pred_df.iter_rows(named=True):
+        p_id = row["protein_id"]
+        term_id = row["term_id"]
+        prob = row["score"]
+
+        ns = ns_dict.get(term_id)
+        if ns in gts and p_id in gts[ns].ids:
+            i = gts[ns].ids[p_id]
+            term_ids = [term_id]
+            if term_id in ontologies[ns].terms_dict_alt:
+                term_ids = ontologies[ns].terms_dict_alt[term_id]
+                replaced.setdefault(ns, 0)
+                replaced[ns] += len(term_ids)
+            for term_id in term_ids:
+                if max_terms is None or np.count_nonzero(matrix[ns][i]) <= max_terms:
+                    j = ontologies[ns].terms_dict.get(term_id)["index"]
+                    ids[ns][p_id] = i
+                    matrix[ns][i, j] = max(matrix[ns][i, j], float(prob))
+
+    predictions = {}
+    for ns in ids:
+        if ids[ns]:
+            logging.debug("pred matrix {} {} ".format(ns, matrix[ns]))
+            propagate(matrix[ns], ontologies[ns], ontologies[ns].order, mode=prop_mode)
+            logging.debug("pred matrix propagated {} {} ".format(ns, matrix[ns]))
+            predictions[ns] = Prediction(ids[ns], matrix[ns], ns)
+            logging.info(
+                "Prediction from DataFrame: {}, proteins {}, annotations {}, replaced alt. ids {}".format(
+                    ns, len(ids[ns]), np.count_nonzero(matrix[ns]), replaced.get(ns, 0)
+                )
+            )
+
+    if not predictions:
+        logging.warning("Empty prediction! Check format or overlap with ground truth")
+
+    return predictions
+
+
+def cafa_eval_df(
+    obo_file,
+    pred_df,
+    gt_file,
+    ia=None,
+    no_orphans=False,
+    norm="cafa",
+    prop="max",
+    max_terms=None,
+    th_step=0.01,
+    n_cpu=1,
+    pred_name="prediction",
+):
+    """
+    Evaluate predictions from a polars DataFrame instead of prediction files.
+
+    Args:
+        obo_file: path to the OBO ontology file
+        pred_df: polars DataFrame with columns 'protein_id', 'term_id', 'score'
+        gt_file: path to the ground truth file
+        ia: path to information accretion file (optional)
+        no_orphans: exclude orphan terms from evaluation
+        norm: normalization mode ('cafa', 'pred', 'gt')
+        prop: propagation mode ('max', 'fill')
+        max_terms: max number of terms per protein (optional)
+        th_step: threshold step size for tau values
+        n_cpu: number of CPUs (unused, kept for API compatibility)
+        pred_name: name to use for the prediction in output
+
+    Returns:
+        tuple of (df, dfs_best) where df is the full evaluation DataFrame
+        and dfs_best is a dict of DataFrames with best metrics per filename/ns
+    """
+    # Tau array, used to compute metrics at different score thresholds
+    tau_arr = np.arange(th_step, 1, th_step)
+
+    # Parse the OBO file and creates a different graphs for each namespace
+    ontologies = obo_parser(obo_file, ("is_a", "part_of"), ia, not no_orphans)
+
+    # Parse ground truth file
+    gt = gt_parser(gt_file, ontologies)
+
+    # Parse prediction DataFrame
+    prediction = pred_df_parser(pred_df, ontologies, gt, prop, max_terms)
+
+    df = None
+    dfs_best = {}
+
+    if not prediction:
+        logging.warning("Prediction from DataFrame not evaluated")
+        return df, dfs_best
+
+    df_pred = evaluate_prediction(
+        prediction, gt, ontologies, tau_arr, normalization=norm, n_cpu=n_cpu
+    )
+    df_pred = df_pred.with_columns(pl.lit(pred_name).alias("filename"))
+
+    df = df_pred.filter(pl.col("cov") > 0)
+
+    # Calculate the best index for each namespace and each evaluation metric
+    for metric, cols in [
+        ("f", ["rc", "pr"]),
+        ("f_w", ["rc_w", "pr_w"]),
+        ("s", ["ru", "mi"]),
+        ("f_micro", ["rc_micro", "pr_micro"]),
+        ("f_micro_w", ["rc_micro_w", "pr_micro_w"]),
+    ]:
+        if metric in df.columns:
+            # Find the best metric value per filename/ns group
+            if metric in ["f", "f_w", "f_micro", "f_micro_w"]:
+                df_best = df.group_by(["filename", "ns"]).agg(
+                    pl.all().sort_by(metric).last()
+                )
+            else:
+                df_best = df.group_by(["filename", "ns"]).agg(
+                    pl.all().sort_by(metric).first()
+                )
+
+            # Calculate max coverage per filename/ns
+            cov_col = "cov_w" if metric[-2:] == "_w" else "cov"
+            cov_max = df.group_by(["filename", "ns"]).agg(
+                pl.col(cov_col).max().alias("cov_max")
+            )
+            df_best = df_best.join(cov_max, on=["filename", "ns"])
+
+            dfs_best[metric] = df_best
+
+    logging.info("Prediction from DataFrame: {}, evaluated".format(pred_name))
+
+    return df, dfs_best
+
+
+def cafa_score(
+    obo_file,
+    pred_df,
+    gt_file,
+    ia,
+    no_orphans=False,
+    norm="cafa",
+    prop="max",
+    max_terms=None,
+    th_step=0.01,
+):
+    """
+    Compute the CAFA evaluation score (single number) for predictions.
+
+    This returns the average weighted F-max (f_w) across the three ontologies
+    (BPO, MFO, CCO), which is the metric used by Kaggle for CAFA6.
+
+    Args:
+        obo_file: path to the OBO ontology file (go-basic.obo)
+        pred_df: polars DataFrame with columns 'protein_id', 'term_id', 'score'
+        gt_file: path to the ground truth file (train_terms.tsv format)
+        ia: path to information accretion file (IA.tsv) - required for weighted score
+        no_orphans: exclude orphan terms from evaluation
+        norm: normalization mode ('cafa', 'pred', 'gt')
+        prop: propagation mode ('max', 'fill')
+        max_terms: max number of terms per protein (optional)
+        th_step: threshold step size for tau values
+
+    Returns:
+        float: the CAFA score (average weighted F-max across ontologies)
+
+    Example:
+        >>> import polars as pl
+        >>> from cafaeval.evaluation import cafa_score
+        >>>
+        >>> pred_df = pl.DataFrame({
+        ...     "protein_id": ["P12345", "P12345", "P67890"],
+        ...     "term_id": ["GO:0008150", "GO:0003674", "GO:0008150"],
+        ...     "score": [0.9, 0.8, 0.7],
+        ... })
+        >>>
+        >>> score = cafa_score(
+        ...     obo_file="go-basic.obo",
+        ...     pred_df=pred_df,
+        ...     gt_file="train_terms.tsv",
+        ...     ia="IA.tsv",
+        ... )
+        >>> print(f"CAFA Score: {score:.4f}")
+    """
+    df, dfs_best = cafa_eval_df(
+        obo_file=obo_file,
+        pred_df=pred_df,
+        gt_file=gt_file,
+        ia=ia,
+        no_orphans=no_orphans,
+        norm=norm,
+        prop=prop,
+        max_terms=max_terms,
+        th_step=th_step,
+    )
+
+    if dfs_best is None or "f_w" not in dfs_best:
+        logging.warning(
+            "No weighted F-max scores available. Check if IA file is provided."
+        )
+        return 0.0
+
+    df_best_fw = dfs_best["f_w"]
+
+    # Get the f_w score for each namespace
+    # Expected namespaces: biological_process, molecular_function, cellular_component
+    ns_scores = df_best_fw.group_by("ns").agg(pl.col("f_w").max())
+
+    # Calculate average across all namespaces present
+    if ns_scores.height == 0:
+        logging.warning("No namespace scores found.")
+        return 0.0
+
+    avg_score = ns_scores["f_w"].mean()
+
+    return float(avg_score)
 
 
 def write_results(df, dfs_best, out_dir="results", th_step=0.01):
